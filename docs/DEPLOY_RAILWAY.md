@@ -1,8 +1,10 @@
 # Railway deployment
 
-Vantage deploys from this monorepo as four application services plus a
-pgvector-compatible Postgres service. Only `web` gets a public domain. The
-worker, embed API, embed cron and database stay on Railway's private network.
+Vantage deploys from `duaragha/vantage` on GitHub as four application services
+plus a pgvector-compatible Postgres service. The application services track
+the `main` branch; Postgres continues to use the `pgvector/pgvector:pg16`
+image. Only `web` gets a public domain. The worker, embed API, embed cron and
+database stay on Railway's private network.
 
 This layout keeps the dashboard and schedulers warm, but moves the roughly
 800 MiB local embedding model out of the always-on worker. Semantic chat wakes
@@ -30,9 +32,11 @@ Konpeki.
    Mount a volume at `/var/lib/postgresql/data` and set
    `PGDATA=/var/lib/postgresql/data/pgdata`; the subdirectory avoids the
    mount's `lost+found` entry blocking `initdb`.
-2. Add four empty application services and deploy this repository with
-   `railway up -s <service>`. In each service's settings, set the config-file
-   path from the table above.
+2. Add four empty application services, connect each one to
+   `duaragha/vantage` on the `main` branch, and set its config-file path from
+   the table above. Railway then deploys only when that service's watch
+   patterns match a pushed change. Use `railway up -s <service>` only as a
+   break-glass deployment path when GitHub is unavailable.
 3. Railway creates the private `*.railway.internal` names automatically.
    Generate a public Railway or custom domain only for `web`.
 4. Turn Serverless on for `embed-api`. Leave it off for `web`, `worker`, the
