@@ -519,7 +519,7 @@ function NotificationToggle({
         aria-label={title}
         onClick={() => onChange(!checked)}
         className={cn(
-          'relative h-8 w-[3.25rem] shrink-0 rounded-full border transition-colors active:scale-95',
+          'relative h-8 w-[3.25rem] shrink-0 rounded-full border outline-none transition-colors active:scale-95 focus-visible:ring-2 focus-visible:ring-[var(--cc-accent)]/60 focus-visible:ring-offset-2 focus-visible:ring-offset-black',
           checked
             ? 'border-[var(--cc-accent)]/35 bg-[var(--cc-accent)]/25'
             : 'border-white/[0.1] bg-white/[0.05]',
@@ -527,8 +527,8 @@ function NotificationToggle({
       >
         <span
           className={cn(
-            'absolute top-1 size-6 rounded-full shadow-sm transition-transform',
-            checked ? 'translate-x-[1.35rem] bg-[var(--cc-accent)]' : 'translate-x-1 bg-zinc-500',
+            'absolute left-1 top-1 size-6 rounded-full shadow-sm transition-transform',
+            checked ? 'translate-x-5 bg-[var(--cc-accent)]' : 'translate-x-0 bg-zinc-500',
           )}
         />
       </button>
