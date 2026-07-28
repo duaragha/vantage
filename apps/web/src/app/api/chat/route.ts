@@ -46,10 +46,10 @@ import { tavilySearch } from '@/lib/tavily';
 import { embedderConfigured, embedText } from '@/lib/embedderClient';
 import { isAuthed } from '@/lib/auth';
 import { normalizeChatMessage } from '@/lib/chatInput';
+import { extractTickers, resolveConversationTickers } from '@/lib/chatTickers';
 import { handleMutationTool, MUTATION_TOOLS, MUTATION_TOOL_NAMES } from './mutationTools';
 
 const log = componentLogger('web/api/chat');
-const MAX_TICKER_CANDIDATES = 32;
 
 function chatFailureMessage(err: unknown): string {
   if (err instanceof SpendCapError) {
@@ -73,11 +73,6 @@ async function loadEmbed(): Promise<EmbedModule | null> {
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
-// Case-insensitive so lowercase-typed tickers ("acel", "rklb") also get
-// extracted. The retrieval layer treats unknown tickers as empty results,
-// so picking up common English words as false-positive candidates is cheap.
-const TICKER_RE = /\b([A-Za-z]{1,6})\b/g;
-
 /**
  * Sentence appended to the cached system prompt so the model knows what
  * structured context lives in the retrieved block. The text itself is static —
@@ -99,9 +94,16 @@ You have FULL READ access to:
 - Recent insights / alerts the engine has emitted (last 20)
 - System health: when each cron last ran, today's LLM spend vs cap, kill-switch state
 - User settings: position cap, sector cap, intraday move threshold, discovery weights, timezone
-- Last 5 turns of THIS conversation (for follow-up questions)
+- Last 6 messages of THIS conversation, passed as native user/assistant turns
 
 When the user asks ANYTHING about their own data — goals, watchlist, spend, last job run, settings, prior conversation — answer from this context. Never say "I don't have access to that." If a section is explicitly marked unavailable, say it is temporarily unavailable and do not substitute zero, off, or an empty list. Only say "You don't have any X yet" when the context confirms the section loaded successfully and is empty.
+
+Conversation grounding:
+- The latest user statement and any explicit correction override retrieved market data and older turns.
+- A follow-up with no ticker refers to the active ticker named most recently by the user. Never reinterpret ordinary words such as "all", "ill", "just", or "cause" as ticker symbols.
+- Vantage does not sync holdings from Wealthsimple or any broker. Positions appear only after the user manually adds or edits them. Never invent a pending purchase or sync delay.
+- If the user says they bought shares that are not recorded yet, use the share count and price they stated as the current position for the answer, briefly note that they still need to enter it manually, and continue the requested analysis.
+- If the user declines an offered action or says they will do it themselves, do not offer the same action again.
 
 Goals also have an optional \`strategy\` field (Income / Growth / Balanced / Preservation) shown on each goal's headline when set. When set, it overrides the type-based default for security selection — Income biases toward dividend/REIT picks, Growth toward broad-market and growth ETFs, Balanced spreads across all three sleeves, Preservation forces cash/short-bond. When the user asks about a goal, mention the strategy if it's set and what it implies for the picks (e.g. "this is a Growth-focused Retirement goal so top picks are growth ETFs + discovery picks, not dividend stocks"). Tax considerations remain automatic — never lecture the user about tax wrappers in the context of strategy.
 
@@ -291,7 +293,22 @@ export async function POST(req: Request): Promise<Response> {
     let assistantText = '';
     let citations: ChatCitation[] = [];
     try {
-      const mentioned = extractTickers(message);
+      const priorUserRows = await prisma.chatMessage.findMany({
+        where: {
+          threadId: thread.id,
+          role: 'user',
+          createdAt: { lt: userRow.createdAt },
+        },
+        orderBy: { createdAt: 'desc' },
+        take: 6,
+        select: { content: true },
+      });
+      const explicitTickers = extractTickers(message);
+      const mentioned = resolveConversationTickers(
+        message,
+        priorUserRows.map((row) => row.content),
+      );
+      const activeTicker = explicitTickers[0] ?? mentioned[0] ?? null;
       const held = (await listOpenPositions()).map((p) => p.ticker);
 
       const embedMod = await loadEmbed();
@@ -319,12 +336,18 @@ export async function POST(req: Request): Promise<Response> {
       const portfolioCtx = await buildPortfolioContext();
       const systemPrompt = buildSystemPrompt();
 
-      const retrievedBlock = formatRetrievedBlock(bundle, { userMessage: message });
+      const retrievedBlock = formatRetrievedBlock(bundle, {
+        userMessage: message,
+        includeRecentConversation: false,
+      });
+      const conversationFocus = activeTicker
+        ? `# Conversation focus\n\nThe active ticker is ${activeTicker}. Treat omitted ticker references and pronouns in the latest user message as referring to ${activeTicker} unless the user explicitly changes the subject.`
+        : '# Conversation focus\n\nNo active ticker was resolved. Do not infer one from ordinary prose.';
 
       // Cache-stable prefix (system + portfolio + static awareness suffix) is
       // concatenated FIRST. The dynamic retrieved block lands after so the
       // cached prefix bytes stay identical across messages.
-      const combinedSystem = `${systemPrompt}\n\n${CONTEXT_AWARENESS_SUFFIX}\n\n${portfolioCtx}\n\n${retrievedBlock}`;
+      const combinedSystem = `${systemPrompt}\n\n${CONTEXT_AWARENESS_SUFFIX}\n\n${portfolioCtx}\n\n${conversationFocus}\n\n${retrievedBlock}`;
 
       try {
         // Multi-turn loop: the built-in web_search_20250305 is server-side and
@@ -333,7 +356,14 @@ export async function POST(req: Request): Promise<Response> {
         // by appending a tool_result and re-calling. We cap at 5 turns + 3
         // Tavily calls so a runaway model can't spin or blow the budget.
         type ChatMessages = Parameters<typeof callClaude>[0]['messages'];
-        const messages: ChatMessages = [{ role: 'user', content: message }];
+        const messages: ChatMessages = bundle.recentMessages
+          .filter((turn) => turn.role === 'user' || turn.role === 'assistant')
+          .map((turn) => ({
+            role: turn.role as 'user' | 'assistant',
+            content:
+              turn.content.length > 4_000 ? `${turn.content.slice(0, 4_000)}…` : turn.content,
+          }));
+        messages.push({ role: 'user', content: message });
         let tavilyCalls = 0;
         const explicitWebCitations: ChatCitation[] = [];
         const tavilyCitationCandidates: ChatCitation[] = [];
@@ -506,110 +536,4 @@ export async function POST(req: Request): Promise<Response> {
     log.error({ err }, 'chat POST failed');
     return NextResponse.json({ error: 'chat unavailable' }, { status: 500 });
   }
-}
-
-// Common English words that aren't tickers, to keep the candidate set sane.
-// Real tickers that collide with these (HE — Hawaiian Electric, OR — Oregon
-// nothing-listed) can be re-added by the user explicitly typing uppercase.
-const TICKER_STOPWORDS = new Set([
-  'A',
-  'I',
-  'AN',
-  'AS',
-  'AT',
-  'BE',
-  'BY',
-  'DO',
-  'GO',
-  'HE',
-  'IF',
-  'IN',
-  'IS',
-  'IT',
-  'MY',
-  'NO',
-  'OF',
-  'ON',
-  'OR',
-  'SO',
-  'TO',
-  'UP',
-  'US',
-  'WE',
-  'THE',
-  'AND',
-  'ARE',
-  'BUT',
-  'CAN',
-  'FOR',
-  'GET',
-  'GOT',
-  'HAS',
-  'HAD',
-  'HOW',
-  'ITS',
-  'LET',
-  'MAY',
-  'NOT',
-  'NOW',
-  'OUR',
-  'OUT',
-  'PUT',
-  'SAY',
-  'SEE',
-  'SHE',
-  'TOO',
-  'WAS',
-  'WAY',
-  'WHO',
-  'WHY',
-  'YOU',
-  'THAT',
-  'THIS',
-  'WITH',
-  'WHAT',
-  'FROM',
-  'THEY',
-  'WERE',
-  'WHEN',
-  'HERE',
-  'BEEN',
-  'SAID',
-  'HAVE',
-  'WOULD',
-  'COULD',
-  'SHOULD',
-  'GOING',
-  'WHICH',
-  'BEING',
-  'ABOUT',
-  'SCORE',
-  'STOCK',
-  'GOOD',
-  'BAD',
-  'HIGH',
-  'LOW',
-  'LIKE',
-  'DOWN',
-  'LAST',
-  'DAY',
-  'DAYS',
-  'WEEK',
-  'YEAR',
-  'MONTH',
-  'LOOK',
-  'THINK',
-]);
-
-function extractTickers(text: string): string[] {
-  const matches = text.match(TICKER_RE) ?? [];
-  const out = new Set<string>();
-  for (const m of matches) {
-    if (m.length < 2 || m.length > 5) continue;
-    const upper = m.toUpperCase();
-    if (TICKER_STOPWORDS.has(upper)) continue;
-    out.add(upper);
-    if (out.size >= MAX_TICKER_CANDIDATES) break;
-  }
-  return [...out];
 }

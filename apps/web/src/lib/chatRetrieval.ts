@@ -11,7 +11,7 @@
  *   - 30d / 6mo / 1y price summary derived from DailyBar.
  *   - Omniscient app-state sections: accounts, goals, watchlist, insights,
  *     system health (job runs + LLM spend + kill switch), user settings, and
- *     last 5 ChatMessage turns of prior conversation. Each section distinguishes
+ *     last 6 ChatMessage turns of prior conversation. Each section distinguishes
  *     a confirmed empty result from a failed lookup so the model never turns a
  *     database outage into a false "you don't have any X" claim.
  *
@@ -659,7 +659,8 @@ export async function retrieveChatContext(opts: RetrieveOpts): Promise<ChatRetri
       .catch((err) => degraded('spend', { _sum: { costUsd: null } }, err)),
     // ---- Prior turns in this thread. Filter by `excludeMessagesAfter` so the
     // current user message (already persisted) doesn't show up in its own
-    // context block. Pull desc + slice so we always get the freshest 5.
+    // context block. Pull an even number so a normal alternating conversation
+    // starts with a user turn when passed back to the Messages API.
     prisma.chatMessage
       .findMany({
         where: {
@@ -667,7 +668,7 @@ export async function retrieveChatContext(opts: RetrieveOpts): Promise<ChatRetri
           ...(opts.excludeMessagesAfter ? { createdAt: { lt: opts.excludeMessagesAfter } } : {}),
         },
         orderBy: { createdAt: 'desc' },
-        take: 5,
+        take: 6,
       })
       .catch((err) =>
         degraded(
@@ -1215,6 +1216,7 @@ function describeJobMeta(meta: unknown): string {
 
 export interface FormatOpts {
   userMessage?: string;
+  includeRecentConversation?: boolean;
 }
 
 export function formatRetrievedBlock(bundle: ChatRetrievalBundle, opts: FormatOpts = {}): string {
@@ -1423,7 +1425,10 @@ export function formatRetrievedBlock(bundle: ChatRetrievalBundle, opts: FormatOp
   // Recent conversation — only render when there's prior history. The current
   // user message isn't included; that's guaranteed by `excludeMessagesAfter`
   // in the caller.
-  if (unavailable.has('conversation')) {
+  if (opts.includeRecentConversation === false) {
+    // The route passes these rows as native user/assistant messages. Avoid
+    // duplicating and weakening them inside the system context.
+  } else if (unavailable.has('conversation')) {
     sections.push('', '## Recent conversation');
     sections.push('(prior conversation is unavailable for this response)');
   } else if (bundle.recentMessages.length > 0) {
