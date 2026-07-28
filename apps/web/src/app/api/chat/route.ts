@@ -26,7 +26,14 @@ import {
   searchThesisEvaluationsByEmbedding,
 } from '@vantage/db';
 import type { Prisma } from '@vantage/db';
-import { buildPortfolioContext, buildSystemPrompt, callClaude, SONNET_MODEL } from '@vantage/llm';
+import {
+  buildPortfolioContext,
+  buildSystemPrompt,
+  callClaude,
+  KillSwitchError,
+  SONNET_MODEL,
+  SpendCapError,
+} from '@vantage/llm';
 import { componentLogger } from '@vantage/notify';
 import {
   collectAnthropicWebCitations,
@@ -43,6 +50,16 @@ import { handleMutationTool, MUTATION_TOOLS, MUTATION_TOOL_NAMES } from './mutat
 
 const log = componentLogger('web/api/chat');
 const MAX_TICKER_CANDIDATES = 32;
+
+function chatFailureMessage(err: unknown): string {
+  if (err instanceof SpendCapError) {
+    return `Chat is paused because the ${err.scope} LLM spend cap has been reached. Review spend and resume LLM automation in Settings when ready.`;
+  }
+  if (err instanceof KillSwitchError) {
+    return 'Chat is paused because the LLM kill switch is on. Review spend and resume LLM automation in Settings when ready.';
+  }
+  return 'Chat is temporarily unavailable. Please try again.';
+}
 
 async function loadEmbed(): Promise<EmbedModule | null> {
   if (!embedderConfigured()) return null;
@@ -451,7 +468,7 @@ export async function POST(req: Request): Promise<Response> {
         });
       } catch (err) {
         log.error({ err }, 'chat Claude call failed');
-        assistantText = 'Chat is temporarily unavailable. Please try again.';
+        assistantText = chatFailureMessage(err);
       }
     } catch (err) {
       log.error({ err }, 'chat context preparation failed');
